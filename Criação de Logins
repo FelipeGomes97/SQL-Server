@@ -1,0 +1,282 @@
+# Esse código valida os logins do arquivo (backup de logins), verifica se há na instância e, se houver, dropa e recria. Se não houver, cria com o mesmo hash de senha e SID.
+# Também ignora logins de semana para não dropar e recriar.
+
+$File      = 'Diretório de onde está o arquivo de backup dos logins'
+
+$Instance  = 'Nome da Instância'
+
+$StampFile = 'Arquivo a ser criado para armazenar o hash (Diretório)'
+
+$LogFile   = 'Arquivo a ser criado para armazenar os logs das execuções (Diretório)'
+
+
+$ErrorActionPreference = 'Stop'
+
+Set-StrictMode -Version Latest
+
+
+$systemLogins = @(
+
+    'sa', 'NT AUTHORITY\SYSTEM', 'NT SERVICE\Winmgmt',
+
+    'NT SERVICE\ClusSvc', 'NT SERVICE\MSSQL$*', 'NT SERVICE\SQLAgent$*',
+
+    'NT SERVICE\SQLTELEMETRY$*', 'NT SERVICE\SQLWriter', '##MS*',
+
+    'NT*'
+
+)
+
+$tempScript = $null
+
+try {
+
+    function Write-Log([string]$msg) {
+
+        "[{0}] {1}" -f ((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')), $msg |
+
+            Out-File -Append $LogFile -Encoding UTF8
+
+    }
+
+    if (-not (Test-Path $File)) {
+
+        Write-Log "Arquivo de origem não encontrado: $File. Encerrando."
+
+        exit 0
+
+    }
+
+    function Test-FileUnlocked($Path) {
+
+        try { $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'None'); $fs.Close(); $true }
+
+        catch { $false }
+
+    }
+
+    $tries = 0
+
+    while (-not (Test-FileUnlocked $File) -and $tries -lt 30) {
+
+        Write-Log "Aguardando liberação do arquivo: $File..."
+
+        Start-Sleep 2; $tries++
+
+    }
+
+    $hash = (Get-FileHash -Algorithm SHA256 $File).Hash
+
+    $lastHash = if (Test-Path $StampFile) { (Get-Content $StampFile -Raw).Trim() } else { '' }
+
+    if ($hash -eq $lastHash) {
+
+        Write-Log "Hashes são idênticos. Nenhuma mudança detectada. Encerrando."
+
+        exit 0
+
+    }
+
+    Write-Log "Mudança detectada. Prosseguindo com a sincronização."
+
+    function New-LoginScriptWithDrop {
+
+        param(
+
+            [string]$InputPath,
+
+            [string[]]$LoginsToExclude,
+
+            [string]$Instance
+
+        )
+
+        $content = Get-Content -Path $InputPath -Raw
+
+        $finalScript = New-Object System.Text.StringBuilder
+ 
+        $commandRegex = [regex]::new(
+
+            '(CREATE LOGIN(?:.|\n|\r)*?)(?=\n\s*CREATE LOGIN|\z)',
+
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+
+        )
+ 
+        $nameRegex = [regex]::new(
+
+            'CREATE\s+LOGIN\s+(?:\[(?<name>[^\]]+)\]|(?<name>"[^"]+"|\S+))',
+
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+
+        )
+ 
+        $allCommands = $commandRegex.Matches($content)
+ 
+        Write-Log "Encontrados $($allCommands.Count) comandos 'CREATE LOGIN' no arquivo de origem."
+ 
+        foreach ($commandMatch in $allCommands) {
+
+            $commandText = $commandMatch.Groups[1].Value.Trim()
+
+            $nameMatch = $nameRegex.Match($commandText)
+ 
+            if ($nameMatch.Success) {
+
+                $loginName = $nameMatch.Groups['name'].Value.Trim('"').Trim()
+
+                $isExcluded = $false
+
+                foreach ($pattern in $LoginsToExclude) {
+
+                    if ($loginName -like $pattern) {
+
+                        $isExcluded = $true
+
+                        break
+
+                    }
+
+                }
+ 
+                if ($isExcluded) {
+
+                    Write-Log "Ignorando login de sistema: '$loginName'."
+
+                    continue
+
+                }
+ 
+                Write-Log "Processando login para criação: '$loginName'."
+
+                $nBrack = $loginName -replace ']', ']]'
+
+                $nLit = $loginName -replace '''', ''''''
+
+                $createLoginCommand = $commandText -replace '''', ''''''
+
+                [void]$finalScript.AppendLine("PRINT N'------------------------------------------------------------';")
+
+                [void]$finalScript.AppendLine("PRINT N'Processando login: $nLit';")
+
+                [void]$finalScript.AppendLine("SET XACT_ABORT ON;")
+
+                [void]$finalScript.AppendLine("BEGIN TRANSACTION;")
+
+                [void]$finalScript.AppendLine("BEGIN TRY")
+
+                [void]$finalScript.AppendLine("     IF EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'$nLit')")
+
+                [void]$finalScript.AppendLine("     BEGIN")
+
+                [void]$finalScript.AppendLine("         PRINT N'Login existente. Removendo para recriar...';")
+
+                [void]$finalScript.AppendLine("         DROP LOGIN [$nBrack];")
+
+                [void]$finalScript.AppendLine("     END")
+
+                [void]$finalScript.AppendLine("     PRINT N'Executando o comando CREATE LOGIN...';")
+
+                [void]$finalScript.AppendLine("     EXEC(N'$createLoginCommand');")
+
+                [void]$finalScript.AppendLine("     PRINT N'Login $nLit processado com sucesso.';")
+
+                [void]$finalScript.AppendLine("     COMMIT TRANSACTION;")
+
+                [void]$finalScript.AppendLine("END TRY")
+
+                [void]$finalScript.AppendLine("BEGIN CATCH")
+
+                [void]$finalScript.AppendLine("     PRINT N'ERRO CRÍTICO ao processar o login ${nLit}: ' + ERROR_MESSAGE();")
+
+                [void]$finalScript.AppendLine("     IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;")
+
+                [void]$finalScript.AppendLine("     THROW;")
+
+                [void]$finalScript.AppendLine("END CATCH")
+
+                [void]$finalScript.AppendLine("GO")
+
+            }
+
+        }
+
+        $tmpFile = Join-Path $env:TEMP ("apply_logins_{0}.sql" -f ([guid]::NewGuid()))
+
+        Set-Content -Path $tmpFile -Encoding UTF8 -Value $finalScript.ToString()
+
+        return $tmpFile
+
+    }
+
+    Write-Log "Gerando script temporário para aplicação..."
+
+    $tempScript = New-LoginScriptWithDrop -InputPath $File -LoginsToExclude $systemLogins -Instance $Instance
+
+    if ([string]::IsNullOrWhiteSpace((Get-Content $tempScript -Raw -ErrorAction SilentlyContinue))) {
+
+        Write-Log "Nenhum login válido para processar foi encontrado. Sincronização não necessária."
+
+    } else {
+
+        Write-Log "Executando script de sincronização na instância $Instance..."
+
+        Invoke-Sqlcmd -ServerInstance $Instance -InputFile $tempScript -ErrorAction Stop -QueryTimeout 0
+
+        Write-Log "Sincronização de logins concluída com sucesso."
+
+    }
+
+    Set-Content -Path $StampFile -Value $hash
+
+    Write-Log "Arquivo de hash atualizado para: $hash."
+
+}
+
+catch {
+
+    $errorMessage = $_.Exception.Message
+
+    if ($errorMessage -like "*Supplied parameter sid is in use*") {
+
+        Write-Log "AVISO: Erro de SID em uso foi detectado. Este erro será ignorado e o job continuará."
+
+        $hashCalculated = (Get-FileHash -Algorithm SHA256 $File).Hash
+
+        Set-Content -Path $StampFile -Value $hashCalculated
+
+        Write-Log "Arquivo de hash atualizado para ignorar o erro de SID."
+
+    } elseif ($errorMessage -like "*Windows NT user or group*not found*") {
+
+        Write-Log "AVISO: Um ou mais logins não foram criados porque o usuário não foi encontrado no Active Directory. O job continuará."
+
+        Write-Log "   -> Erro específico: $errorMessage"
+
+        $hashCalculated = (Get-FileHash -Algorithm SHA256 $File).Hash
+
+        Set-Content -Path $StampFile -Value $hashCalculated
+
+        Write-Log "Arquivo de hash atualizado para ignorar o erro de usuário não encontrado."
+ 
+    } else {
+
+        Write-Log "ERRO CRÍTICO: Ocorreu uma falha inesperada durante a execução. Mensagem: $errorMessage"
+
+        throw $_
+
+    }
+
+}
+
+finally {
+
+    if ($tempScript -and (Test-Path $tempScript)) {
+
+        Write-Log "Limpando arquivo temporário: $tempScript"
+
+        Remove-Item $tempScript -ErrorAction SilentlyContinue
+
+    }
+
+}
