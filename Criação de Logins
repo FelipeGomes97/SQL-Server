@@ -1,5 +1,5 @@
 # Esse código valida os logins do arquivo (backup de logins), verifica se há na instância e, se houver, dropa e recria. Se não houver, cria com o mesmo hash de senha e SID.
-# Também ignora logins de semana para não dropar e recriar.
+# Também ignora logins de sistema para não dropar e recriar.
 
 $File      = 'Diretório de onde está o arquivo de backup dos logins'
 
