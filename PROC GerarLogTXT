@@ -1,0 +1,40 @@
+USE [master]
+GO
+
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+ 
+CREATE PROCEDURE [dbo].[sp_GerarLogTXT]
+    @DataExecucao DATETIME,
+    @LogFilePath NVARCHAR(400),
+	@LogBackupDir NVARCHAR(400)
+AS
+BEGIN
+    SET NOCOUNT ON;
+	
+    DECLARE @cmd NVARCHAR(4000);
+    DECLARE @BodyFilePath NVARCHAR(400) = @LogBackupDir + N'temp_log_body.txt';
+    DECLARE @HeaderFilePath NVARCHAR(400) = @LogBackupDir + N'temp_log_header.txt';
+ 
+    -- NOTA: O BCP usa a tabela global ##LogOutput que é criada no script principal.
+ 
+    -- 1. GERAÇÃO DO CABEÇALHO (Header.txt)
+    SET @cmd = N'echo LOG DE RESTORE - EXECUTADO EM ' + CONVERT(NVARCHAR(19), @DataExecucao, 120) + N' > "' + @HeaderFilePath + N'"';
+    EXEC xp_cmdshell @cmd, no_output;
+ 
+    -- 2. GERAÇÃO DO CORPO (BODY) VIA BCP
+    SET @cmd = N'bcp "SELECT LogEntry FROM tempdb..##LogOutput" queryout "' + @BodyFilePath + N'" -c -T -S' + CAST(SERVERPROPERTY('ServerName') AS NVARCHAR);
+    EXEC xp_cmdshell @cmd, no_output;
+ 
+    -- 3. CONCATENAÇÃO FINAL (COPY: Junta Header.txt + Body.txt no arquivo final)
+    SET @cmd = N'COPY /Y "' + @HeaderFilePath + N'" + "' + @BodyFilePath + N'" "' + @LogFilePath + N'"';
+    EXEC xp_cmdshell @cmd, no_output;
+ 
+    -- 4. LIMPEZA DOS ARQUIVOS TEMPORÁRIOS
+    SET @cmd = N'del "' + @HeaderFilePath + N'" & del "' + @BodyFilePath + N'"';
+    EXEC xp_cmdshell @cmd, no_output;
+END
+GO
