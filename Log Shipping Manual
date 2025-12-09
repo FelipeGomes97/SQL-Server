@@ -1,0 +1,132 @@
+--=====================================================================================
+---------ESTE SCRIPT DEPENDE DA PROC GERAR TXT PARA GERAR ARQUIVO DE REGISTROS---------
+--=====================================================================================
+
+DECLARE @LogBackupDir nvarchar(400) = N'DiretorioDeBackup';
+DECLARE @UndoPath nvarchar(400) = N'DiretorioArmazenarArquivo.TUF';   
+DECLARE @db SYSNAME, @sql NVARCHAR(MAX), @cmd NVARCHAR(1000), @trn_file NVARCHAR(500);
+DECLARE @DataExecucao DATETIME = GETDATE();
+DECLARE @LogEntry NVARCHAR(MAX);
+DECLARE @Erros INT = 0; 
+DECLARE @FinalLogName nvarchar(100);
+DECLARE @LogFilePath nvarchar(400);
+ 
+IF OBJECT_ID('tempdb..#LogExecucao') IS NOT NULL DROP TABLE #LogExecucao;
+
+CREATE TABLE #LogExecucao (
+    LogID INT IDENTITY(1,1),
+    Timestamp DATETIME,
+    Banco NVARCHAR(128),
+    Mensagem NVARCHAR(MAX)
+);
+ 
+IF OBJECT_ID('tempdb..#LogFiles') IS NOT NULL DROP TABLE #LogFiles;
+
+CREATE TABLE #LogFiles (FileName NVARCHAR(512));
+
+DECLARE db_cursor CURSOR STATIC FOR
+    SELECT name
+    FROM master.sys.databases
+    WHERE database_id not in (1, 2, 3, 4)
+    AND is_in_standby = 1;
+ 
+OPEN db_cursor;
+FETCH NEXT FROM db_cursor INTO @db;
+ 
+WHILE @@FETCH_STATUS = 0
+
+BEGIN
+    --SELECT @db = RTRIM(@db); 
+    TRUNCATE TABLE #LogExecucao;
+
+    SET @DataExecucao = GETDATE();
+    SET @FinalLogName = N'RestoreLog_' + FORMAT(@DataExecucao, 'yyyyMMdd_HHmm') + N'.txt'; 
+    SET @LogFilePath = @LogBackupDir + @db + N'\' + @FinalLogName; 
+
+    INSERT INTO #LogExecucao (Timestamp, Banco, Mensagem) VALUES (@DataExecucao, 'INICIO', N'INICIO DA EXECUCAO');
+    INSERT INTO #LogExecucao (Timestamp, Banco, Mensagem) VALUES (GETDATE(), @db, N'Processando logs:');
+
+    SET @cmd = N'dir "' + @LogBackupDir + @db + N'\' + @db + N'*.*" /b /o:n';
+
+    BEGIN TRY
+        INSERT INTO #LogFiles (FileName) EXEC xp_cmdshell @cmd;
+        DELETE FROM #LogFiles WHERE FileName IS NULL OR FileName = '';
+    END TRY
+
+    BEGIN CATCH
+        INSERT INTO #LogExecucao (Timestamp, Banco, Mensagem) VALUES (GETDATE(), @db, N'ERRO CRÍTICO: Falha ao listar arquivos na pasta.');
+
+        SET @Erros = @Erros + 1; 
+
+        GOTO proximo_banco;
+    END CATCH
+
+    DECLARE log_cursor CURSOR STATIC FOR SELECT FileName FROM #LogFiles;
+    OPEN log_cursor;
+    FETCH NEXT FROM log_cursor INTO @trn_file;
+ 
+    WHILE @@FETCH_STATUS = 0
+
+    BEGIN
+        BEGIN TRY
+            SET @sql = N'RESTORE LOG [' + @db + N'] ' +
+                       N'FROM DISK = N''' + @LogBackupDir + @db + N'\' + @trn_file + N''' ' +
+                       N'WITH STANDBY = N''' + @UndoPath + @db + N'.tuf'';';
+
+            EXEC(@sql);
+
+            INSERT INTO #LogExecucao (Timestamp, Banco, Mensagem) VALUES (GETDATE(), @db, N'APLICADO COM SUCESSO: ' + @trn_file);
+ 
+        END TRY
+
+        BEGIN CATCH
+            INSERT INTO #LogExecucao (Timestamp, Banco, Mensagem) 
+            VALUES (GETDATE(), @db, N'AVISO - PULADO: ' + @trn_file + N'. Motivo: ' + ERROR_MESSAGE());
+        END CATCH
+ 
+        FETCH NEXT FROM log_cursor INTO @trn_file;
+    END
+
+    CLOSE log_cursor;
+    DEALLOCATE log_cursor;
+ 
+    INSERT INTO #LogExecucao (Timestamp, Banco, Mensagem) VALUES (GETDATE(), 'FIM', N'FIM DA EXECUCAO');
+
+    -- Variáveis temporárias. São apenas para formar o cabeçalho + corpo do arquivo
+
+    DECLARE @BodyFilePath NVARCHAR(400) = @LogBackupDir + @db + N'\temp_log_body.txt';
+    DECLARE @HeaderFilePath NVARCHAR(400) = @LogBackupDir + @db + N'\temp_log_header.txt';
+
+    IF OBJECT_ID('tempdb..##LogOutput') IS NOT NULL DROP TABLE ##LogOutput;
+
+    SELECT CONCAT(CONVERT(NVARCHAR(19), Timestamp, 120), N' | Banco: ', Banco, N' | ', Mensagem) AS LogEntry
+    INTO ##LogOutput
+    FROM #LogExecucao
+    ORDER BY LogID;
+
+    -- Chama PROC que gera arquivo .txt com os registros das aplicações
+
+	exec master.dbo.sp_GerarLogTXT
+	@DataExecucao = @DataExecucao,
+	@LogBackupDir = @LogBackupDir,
+	@LogFilePath = @LogFilePath
+ 
+    proximo_banco:
+
+    FETCH NEXT FROM db_cursor INTO @db;
+END
+ 
+CLOSE db_cursor;
+DEALLOCATE db_cursor;
+ 
+IF @Erros > 0
+
+BEGIN
+    RAISERROR(N'O Job terminou com erros críticos. Falha ao listar arquivos do diretório. Verifique os logs nas pastas dos bancos.', 16, 1);
+END
+
+ELSE
+
+BEGIN
+    RAISERROR(N'Processo de restauração de logs concluído com sucesso. Verifique os logs individuais.', 10, 1) WITH NOWAIT;
+END
