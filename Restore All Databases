@@ -1,6 +1,6 @@
-DECLARE @BackupDir nvarchar(400) = N'G:\Backups\Copia DR\';
-DECLARE @DataPath nvarchar(400) = N'G:\MSSQL15.PRD02\MSSQL\DATA\';
-DECLARE @LogPath nvarchar(400) = N'H:\MSSQL15.PRD02\MSSQL\Log\';
+DECLARE @BackupDir nvarchar(400) = N'DiretorioDeBackup';
+DECLARE @DataPath nvarchar(400) = N'DiretorioArquivoMDF';
+DECLARE @LogPath nvarchar(400) = N'DiretorioArquivoLDF';
 
 DECLARE db_cursor CURSOR STATIC FOR
 select name
