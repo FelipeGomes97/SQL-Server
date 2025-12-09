@@ -1,0 +1,93 @@
+DECLARE @BackupDir nvarchar(400) = N'DiretorioDeBackup';
+DECLARE @DataPath nvarchar(400) = N'DiretorioMDF';
+DECLARE @LogPath nvarchar(400) = N'DiretorioLDF';
+DECLARE @UndoPath nvarchar(400) = N'DiretorioTUF';
+ 
+DECLARE @ErrorMessage NVARCHAR(4000);
+DECLARE @Msg NVARCHAR(MAX);
+DECLARE db_cursor CURSOR STATIC FOR
+    select name
+    from master.sys.databases
+    where database_id not in (1, 2, 3, 4)
+    and state = 0;
+ 
+DECLARE @db SYSNAME;
+DECLARE @bak NVARCHAR(600);
+DECLARE @sql NVARCHAR(MAX);
+DECLARE @moves NVARCHAR(MAX);
+ 
+OPEN db_cursor;
+FETCH NEXT FROM db_cursor INTO @db;
+ 
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @bak = @BackupDir + @db + N'.bak';
+    IF NOT EXISTS (SELECT 1 FROM sys.master_files WHERE 1 = 0)
+    BEGIN
+        PRINT 'Restaurando banco: ' + @db;
+        IF OBJECT_ID('tempdb..#fl') IS NOT NULL DROP TABLE #fl;
+        CREATE TABLE #fl (
+            LogicalName nvarchar(128), PhysicalName nvarchar(260), [Type] char(1),
+            FileGroupName nvarchar(128) null, Size numeric(20,0) null, MaxSize numeric(20,0) null,
+            FileID int null, CreateLSN numeric(25,0) null, DropLSN numeric(25,0) null,
+            UniqueID uniqueidentifier null, ReadOnlyLSN numeric(25,0), ReadWriteLSN numeric(25,0),
+            BackupSizeInBytes bigint null, SourceBlockSize int null, FileGroupID int null,
+            FileGroupGUID uniqueidentifier null, DifferentialBaseLSN numeric(25,0) null, DifferentialBaseGUID uniqueidentifier null,
+            IsReadOnly bit null, IsPresent bit null, TDEThumbprint varbinary(32) null, SnapshotUrl nvarchar(360) null
+        );
+
+        DECLARE @cmd nvarchar(1000) =
+            N'RESTORE FILELISTONLY FROM DISK = N''' + @bak + N'''';
+        INSERT INTO #fl
+        EXEC(@cmd);
+        ;WITH X AS (
+            SELECT
+                LogicalName, [Type],
+                rnD = CASE WHEN [Type] = 'D'
+                THEN ROW_NUMBER() OVER (PARTITION BY [Type] ORDER BY LogicalName)
+                ELSE NULL END
+            FROM #fl
+        )
+        SELECT @moves = STRING_AGG(
+            'MOVE N''' + f.LogicalName + '''TO N''' +
+            CASE WHEN f.[Type] = 'L' THEN @LogPath ELSE @DataPath END + @db + 
+            CASE 
+                WHEN f.[Type] = 'L' THEN N'_log'
+                WHEN x.rnD = 1 THEN N''
+                ELSE N'_data' + CONVERT(varchar(10), x.rnD)
+            END +
+            CASE WHEN f.[Type] = 'L' THEN N'.ldf'
+                WHEN x.rnD = 1 THEN N'.mdf'
+                ELSE N'.ndf' END + '''',',')
+            FROM #fl f
+            JOIN x ON x.LogicalName = f.LogicalName;
+
+        BEGIN TRY
+
+            SET @sql = 
+                N'ALTER DATABASE [' + @db + N'] ' + N'SET SINGLE_USER WITH ROLLBACK IMMEDIATE; ' +
+                N'RESTORE DATABASE [' + @db + N'] ' +
+                N'FROM DISK = N''' + @bak + N''' ' +
+                N'WITH REPLACE, ' + @moves + N', ' +
+                N'STANDBY = N''' + @UndoPath + @db + N'.tuf''; ' +
+                N'ALTER DATABASE [' + @db + N'] ' + N'SET MULTI_USER;'
+
+            PRINT @sql;
+            EXEC(@sql);
+        END TRY
+
+        BEGIN CATCH
+
+            SET @ErrorMessage = ERROR_MESSAGE();
+            SET @Msg = CONVERT(NVARCHAR, GETDATE(), 120) + N' Restore do banco ' + QUOTENAME(@db) + N' falhou. Mensagem de erro: ' + @ErrorMessage;
+            RAISERROR(@Msg, 11, 1) WITH NOWAIT;
+
+        END CATCH
+    END
+
+    FETCH NEXT FROM db_cursor INTO @db;
+
+END
+ 
+CLOSE db_cursor;
+DEALLOCATE db_cursor;
