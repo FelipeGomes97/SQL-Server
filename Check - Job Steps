@@ -1,0 +1,33 @@
+
+
+USE msdb;
+GO
+
+DECLARE @FailedStepID INT
+ 
+;WITH UltimaExecucaoPorStep AS (
+    SELECT 
+        h.step_id,
+        h.run_status,
+        ROW_NUMBER() OVER (PARTITION BY h.step_id ORDER BY h.instance_id DESC) AS rn
+    FROM sysjobs j
+    INNER JOIN sysjobhistory h ON j.job_id = h.job_id
+    WHERE j.name in ('Job1', 'Job2', 'Job3')
+      AND h.step_id > 0
+)
+ 
+SELECT TOP 1 @FailedStepID = step_id
+FROM UltimaExecucaoPorStep
+WHERE rn = 1 
+AND run_status = 0;
+
+IF (@FailedStepID IS NOT NULL)
+BEGIN
+    RAISERROR('O Step %d do job "%s" falhou na última execução.', 16, 1, @FailedStepID) WITH NOWAIT;
+    RETURN;
+END
+ELSE
+BEGIN
+    PRINT 'Todos os steps rodaram com sucesso.';
+END
+ 
